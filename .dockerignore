@@ -2,7 +2,6 @@
 .github
 .zig-cache
 zig-out
-bin
 *.md
 .gitignore
 .dockerignore
