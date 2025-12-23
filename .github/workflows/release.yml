@@ -114,14 +114,15 @@ jobs:
 
       - name: Create and push manifest
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [[ "$TAG" == "main" ]]; then
-            TAG="latest"
+          SRC_TAG="${GITHUB_REF_NAME}"
+          MANIFEST_TAG="${GITHUB_REF_NAME}"
+          if [[ "$MANIFEST_TAG" == "main" ]]; then
+            MANIFEST_TAG="latest"
           fi
-          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}-arm64
-          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}
+          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${MANIFEST_TAG} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SRC_TAG}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SRC_TAG}-arm64
+          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${MANIFEST_TAG}
 
   release-artifacts:
     if: github.event_name == 'release'
