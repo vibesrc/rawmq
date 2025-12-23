@@ -5,6 +5,7 @@ const protocol = @import("protocol.zig");
 const broker_mod = @import("broker.zig");
 const session_mod = @import("session.zig");
 const topic = @import("topic.zig");
+const io = @import("io/backend.zig");
 
 /// Server configuration
 pub const ServerConfig = struct {
@@ -12,40 +13,73 @@ pub const ServerConfig = struct {
     port: u16 = 1883,
     backlog: u31 = 128,
     recv_buffer_size: usize = 65536,
-    send_buffer_size: usize = 65536,
+    max_events: u32 = 4096,
+    workers: u32 = 0, // 0 = auto-detect CPU count
 };
 
-/// TCP Server - spawns a thread per connection
+/// TCP Server - event-driven with io_uring/epoll backend
 pub const Server = struct {
     const Self = @This();
+    const LISTENER_ID: usize = 0;
 
     allocator: Allocator,
     config: ServerConfig,
     broker: *broker_mod.Broker,
     listener: ?std.posix.socket_t = null,
+    backend: ?io.Backend = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    // Connection management
+    connections: std.AutoHashMap(std.posix.socket_t, *ConnectionHandler),
+    next_conn_id: usize = 1,
+
+    // Event buffer
+    events: []io.Event,
 
     pub fn init(allocator: Allocator, config: ServerConfig, broker: *broker_mod.Broker) !*Self {
         const server = try allocator.create(Self);
+        errdefer allocator.destroy(server);
+
+        const events = try allocator.alloc(io.Event, config.max_events);
+        errdefer allocator.free(events);
+
         server.* = .{
             .allocator = allocator,
             .config = config,
             .broker = broker,
+            .connections = std.AutoHashMap(std.posix.socket_t, *ConnectionHandler).init(allocator),
+            .events = events,
         };
+
         return server;
     }
 
     pub fn deinit(self: *Self) void {
         self.stop();
+
+        // Clean up all connections
+        var it = self.connections.valueIterator();
+        while (it.next()) |handler| {
+            handler.*.deinit();
+            self.allocator.destroy(handler.*);
+        }
+        self.connections.deinit();
+
+        self.allocator.free(self.events);
         self.allocator.destroy(self);
     }
 
     pub fn start(self: *Self) !void {
+        // Initialize I/O backend (io_uring with epoll fallback)
+        self.backend = try io.detectBest(self.allocator, self.config.max_events);
+        errdefer if (self.backend) |b| b.deinit();
+
+        // Create listener socket
         const addr = try std.net.Address.parseIp4(self.config.bind_address, self.config.port);
 
         self.listener = try std.posix.socket(
             std.posix.AF.INET,
-            std.posix.SOCK.STREAM,
+            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
             0,
         );
         errdefer if (self.listener) |l| std.posix.close(l);
@@ -61,66 +95,146 @@ pub const Server = struct {
         try std.posix.bind(self.listener.?, @ptrCast(&addr.any), addr.getOsSockLen());
         try std.posix.listen(self.listener.?, self.config.backlog);
 
+        // Add listener to backend for accept events
+        try self.backend.?.addSocket(self.listener.?, LISTENER_ID);
+
         self.running.store(true, .seq_cst);
 
-        std.debug.print("MQTT broker listening on {s}:{d}\n", .{ self.config.bind_address, self.config.port });
+        std.debug.print("MQTT broker listening on {s}:{d} (backend: {s})\n", .{
+            self.config.bind_address,
+            self.config.port,
+            self.backend.?.name(),
+        });
     }
 
     pub fn stop(self: *Self) void {
         self.running.store(false, .seq_cst);
+        if (self.backend) |b| {
+            b.deinit();
+            self.backend = null;
+        }
         if (self.listener) |l| {
             std.posix.close(l);
             self.listener = null;
         }
     }
 
-    /// Accept connections in a loop (blocking)
-    pub fn acceptLoop(self: *Self) void {
+    /// Main event loop
+    pub fn eventLoop(self: *Self) void {
         while (self.running.load(.seq_cst)) {
-            const client_socket = std.posix.accept(self.listener.?, null, null, 0) catch |err| {
+            const ready = self.backend.?.wait(self.events, 100) catch |err| {
                 if (!self.running.load(.seq_cst)) break;
-                std.debug.print("Accept error: {}\n", .{err});
+                std.debug.print("Event wait error: {}\n", .{err});
                 continue;
             };
 
-            // Spawn connection handler thread
-            const thread = std.Thread.spawn(.{}, handleConnectionWrapper, .{ self, client_socket }) catch {
+            for (ready) |event| {
+                if (event.user_data == LISTENER_ID) {
+                    // Accept new connections
+                    self.handleAccept();
+                } else {
+                    // Handle client event
+                    self.handleClientEvent(event);
+                }
+            }
+        }
+    }
+
+    fn handleAccept(self: *Self) void {
+        // Accept all pending connections
+        while (true) {
+            const client_socket = std.posix.accept(
+                self.listener.?,
+                null,
+                null,
+                std.posix.SOCK.NONBLOCK,
+            ) catch |err| {
+                if (err == error.WouldBlock) break;
+                std.debug.print("Accept error: {}\n", .{err});
+                break;
+            };
+
+            // Create connection handler
+            const handler = ConnectionHandler.init(
+                self.allocator,
+                self.broker,
+                client_socket,
+                self.config.recv_buffer_size,
+            ) catch {
                 std.posix.close(client_socket);
                 continue;
             };
-            thread.detach();
+
+            const conn_id = self.next_conn_id;
+            self.next_conn_id +%= 1;
+            if (self.next_conn_id == LISTENER_ID) self.next_conn_id = 1;
+
+            handler.conn_id = conn_id;
+
+            self.connections.put(client_socket, handler) catch {
+                handler.deinit();
+                self.allocator.destroy(handler);
+                std.posix.close(client_socket);
+                continue;
+            };
+
+            // Add to backend for read events
+            self.backend.?.addSocket(client_socket, conn_id) catch {
+                _ = self.connections.remove(client_socket);
+                handler.deinit();
+                self.allocator.destroy(handler);
+                std.posix.close(client_socket);
+                continue;
+            };
         }
+    }
+
+    fn handleClientEvent(self: *Self, event: io.Event) void {
+        const handler = self.connections.get(event.socket) orelse return;
+
+        switch (event.event_type) {
+            .read => {
+                handler.handleRead() catch |err| {
+                    if (err != error.WouldBlock) {
+                        self.closeConnection(event.socket, handler);
+                        return;
+                    }
+                };
+            },
+            .write => {
+                handler.handleWrite() catch {
+                    self.closeConnection(event.socket, handler);
+                    return;
+                };
+            },
+            .close, .error_event => {
+                self.closeConnection(event.socket, handler);
+                return;
+            },
+        }
+
+        // Check if connection was closed by protocol
+        if (handler.connection) |*conn| {
+            if (conn.isDisconnected()) {
+                self.closeConnection(event.socket, handler);
+            }
+        }
+    }
+
+    fn closeConnection(self: *Self, socket: std.posix.socket_t, handler: *ConnectionHandler) void {
+        self.backend.?.removeSocket(socket);
+        _ = self.connections.remove(socket);
+        handler.deinit();
+        self.allocator.destroy(handler);
+        std.posix.close(socket);
     }
 
     /// Run server (blocking)
     pub fn run(self: *Self) !void {
         try self.start();
-        self.acceptLoop();
+        self.eventLoop();
     }
 };
-
-/// Wrapper for thread spawn
-fn handleConnectionWrapper(server: *Server, socket: std.posix.socket_t) void {
-    handleConnection(server, socket);
-}
-
-/// Handle a single client connection
-fn handleConnection(server: *Server, socket: std.posix.socket_t) void {
-    var handler = ConnectionHandler.init(server.allocator, server.broker, socket, server.config.recv_buffer_size) catch {
-        std.posix.close(socket);
-        return;
-    };
-    defer handler.deinit();
-
-    handler.run() catch |err| {
-        std.debug.print("Connection error: {}\n", .{err});
-    };
-
-    // Close socket if not already closed by disconnect
-    if (handler.connection == null or !handler.connection.?.isDisconnected()) {
-        std.posix.close(socket);
-    }
-}
 
 /// Connection handler - processes packets for a single connection
 pub const ConnectionHandler = struct {
@@ -131,33 +245,39 @@ pub const ConnectionHandler = struct {
     socket: std.posix.socket_t,
     recv_buffer: []u8,
     recv_pos: usize = 0,
+    send_buffer: std.ArrayListUnmanaged(u8) = .{},
+    send_pos: usize = 0,
     parser: protocol.Parser = .{},
     session: ?*session_mod.Session = null,
     connection: ?broker_mod.Connection = null,
     connected: bool = false,
-    clean_disconnect: bool = false, // Set true only when DISCONNECT received
+    clean_disconnect: bool = false,
     encode_buffer: [65536]u8 = undefined,
+    conn_id: usize = 0,
 
     pub fn init(
         allocator: Allocator,
         broker: *broker_mod.Broker,
         socket: std.posix.socket_t,
         buffer_size: usize,
-    ) !Self {
-        return .{
+    ) !*Self {
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
             .allocator = allocator,
             .broker = broker,
             .socket = socket,
             .recv_buffer = try allocator.alloc(u8, buffer_size),
         };
+
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
         if (self.connection) |*conn| {
             self.broker.unregisterConnection(conn);
 
-            // Publish will message if not clean disconnect and not session takeover
-            // Session takeover (another client with same ID connected) should not trigger will
             if (self.session) |session| {
                 if (!self.clean_disconnect and conn.disconnect_reason != .session_taken_over) {
                     self.broker.publishWill(session);
@@ -165,27 +285,27 @@ pub const ConnectionHandler = struct {
                 self.broker.sessions.maybeRemove(session);
             }
         } else if (self.session) |session| {
-            // Connection was never established, clean up session if needed
             self.broker.sessions.maybeRemove(session);
         }
 
         self.allocator.free(self.recv_buffer);
+        self.send_buffer.deinit(self.allocator);
     }
 
-    pub fn run(self: *Self) !void {
+    /// Handle read-ready event
+    pub fn handleRead(self: *Self) !void {
         while (true) {
-            // Check if disconnected
-            if (self.connection) |*conn| {
-                if (conn.isDisconnected()) break;
+            if (self.recv_pos >= self.recv_buffer.len) {
+                // Buffer full, can't read more
+                return error.BufferFull;
             }
 
-            // Read data
             const n = std.posix.recv(self.socket, self.recv_buffer[self.recv_pos..], 0) catch |err| {
-                if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
+                if (err == error.WouldBlock) return;
                 return err;
             };
 
-            if (n == 0) break; // Connection closed
+            if (n == 0) return error.ConnectionClosed;
 
             self.recv_pos += n;
             _ = self.broker.stats.bytes_received.fetchAdd(n, .monotonic);
@@ -195,21 +315,40 @@ pub const ConnectionHandler = struct {
         }
     }
 
+    /// Handle write-ready event
+    pub fn handleWrite(self: *Self) !void {
+        while (self.send_pos < self.send_buffer.items.len) {
+            const n = std.posix.send(self.socket, self.send_buffer.items[self.send_pos..], 0) catch |err| {
+                if (err == error.WouldBlock) return;
+                return err;
+            };
+            self.send_pos += n;
+        }
+
+        // All data sent, clear buffer
+        self.send_buffer.clearRetainingCapacity();
+        self.send_pos = 0;
+    }
+
+    /// Queue data to be sent
+    pub fn queueSend(self: *Self, data: []const u8) !void {
+        try self.send_buffer.appendSlice(self.allocator, data);
+        // Try to send immediately
+        self.handleWrite() catch {};
+    }
+
     fn processPackets(self: *Self) !void {
         while (self.recv_pos > 0) {
-            // Check if we have a complete packet
             const pkt_len = protocol.packetLength(self.recv_buffer[0..self.recv_pos]) catch |err| {
-                if (err == error.IncompletePacket) return; // Need more data
+                if (err == error.IncompletePacket) return;
                 return err;
             };
 
-            if (pkt_len > self.recv_pos) return; // Need more data
+            if (pkt_len > self.recv_pos) return;
 
-            // Parse and handle packet
             const pkt_data = self.recv_buffer[0..pkt_len];
             try self.handlePacket(pkt_data);
 
-            // Shift remaining data
             if (pkt_len < self.recv_pos) {
                 std.mem.copyForwards(u8, self.recv_buffer, self.recv_buffer[pkt_len..self.recv_pos]);
             }
@@ -241,7 +380,6 @@ pub const ConnectionHandler = struct {
 
     fn handleConnect(self: *Self, connect: protocol.ConnectPacket) !void {
         if (self.connected) {
-            // Second CONNECT is protocol error
             if (self.connection) |*conn| {
                 conn.disconnect(.protocol_error);
             }
@@ -250,25 +388,19 @@ pub const ConnectionHandler = struct {
 
         var encoder = protocol.Encoder.init(&self.encode_buffer);
 
-        // Validate client ID
         var client_id = connect.client_id;
         if (client_id.len == 0) {
             if (!connect.flags.clean_session) {
-                // Empty client ID with clean_session=0 is rejected
                 const pkt = try encoder.connack(false, @intFromEnum(protocol.ConnackReturnCode.identifier_rejected));
-                _ = try std.posix.send(self.socket, pkt, 0);
+                try self.queueSend(pkt);
                 return;
             }
-            // Generate client ID for clean session
-            client_id = "auto-generated"; // TODO: generate unique ID
+            client_id = "auto-generated";
         }
 
-        // Get or create session
         const result = try self.broker.sessions.getOrCreate(client_id, connect.flags.clean_session);
         self.session = result.session;
 
-        // If clean_session=true, clear subscriptions from topic tree and reset session state
-        // Must clear topic tree BEFORE calling session.clear() since we need the subscription IDs
         if (connect.flags.clean_session) {
             self.broker.clearSessionSubscriptions(self.session.?);
             self.session.?.clear();
@@ -281,7 +413,6 @@ pub const ConnectionHandler = struct {
         self.session.?.last_activity = std.time.timestamp();
         self.parser.version = connect.protocol_version;
 
-        // Set up will message
         if (connect.flags.will_flag) {
             if (connect.will_topic) |wt| {
                 try self.session.?.setWill(
@@ -289,26 +420,23 @@ pub const ConnectionHandler = struct {
                     connect.will_payload orelse "",
                     @enumFromInt(connect.flags.will_qos),
                     connect.flags.will_retain,
-                    0, // will delay
+                    0,
                 );
             }
         }
 
-        // Create connection handle
         self.connection = broker_mod.Connection.init(self.broker, self.session.?, self.socket);
         try self.broker.registerConnection(&self.connection.?);
         self.connected = true;
 
-        // Send CONNACK
         if (connect.protocol_version == .v5_0) {
             const pkt = try encoder.connackV5(result.existed, .success, null);
-            _ = try std.posix.send(self.socket, pkt, 0);
+            try self.queueSend(pkt);
         } else {
             const pkt = try encoder.connack(result.existed, 0x00);
-            _ = try std.posix.send(self.socket, pkt, 0);
+            try self.queueSend(pkt);
         }
 
-        // Deliver any queued messages for this session (for persistent sessions)
         if (result.existed and !connect.flags.clean_session) {
             self.broker.deliverQueuedMessages(&self.connection.?);
         }
@@ -320,7 +448,6 @@ pub const ConnectionHandler = struct {
         const session = self.session.?;
         session.last_activity = std.time.timestamp();
 
-        // Validate topic name
         if (!topic.validateTopicName(publish.topic)) {
             if (self.connection) |*conn| {
                 conn.disconnect(.topic_name_invalid);
@@ -329,29 +456,24 @@ pub const ConnectionHandler = struct {
         }
 
         var encoder = protocol.Encoder.init(&self.encode_buffer);
-
-        // Extract properties data for v5.0
         const props_data: ?[]const u8 = if (publish.properties) |p| p.data else null;
 
         switch (publish.qos) {
             .at_most_once => {
-                // QoS 0: Just publish
                 try self.broker.publishWithProps(session, publish.topic, publish.payload, publish.qos, publish.retain, props_data);
             },
             .at_least_once => {
-                // QoS 1: Publish and acknowledge
                 try self.broker.publishWithProps(session, publish.topic, publish.payload, publish.qos, publish.retain, props_data);
                 const pkt = try encoder.puback(publish.packet_id.?);
-                try self.connection.?.sendPacket(pkt);
+                try self.queueSend(pkt);
             },
             .exactly_once => {
-                // QoS 2: Check for duplicate, store, send PUBREC
                 if (!session.hasIncomingQos2(publish.packet_id.?)) {
                     try session.recordIncomingQos2(publish.packet_id.?);
                     try self.broker.publishWithProps(session, publish.topic, publish.payload, publish.qos, publish.retain, props_data);
                 }
                 const pkt = try encoder.pubrec(publish.packet_id.?);
-                try self.connection.?.sendPacket(pkt);
+                try self.queueSend(pkt);
             },
         }
     }
@@ -366,7 +488,7 @@ pub const ConnectionHandler = struct {
         if (self.session == null) return;
         var encoder = protocol.Encoder.init(&self.encode_buffer);
         const pkt = try encoder.pubrel(ack.packet_id);
-        try self.connection.?.sendPacket(pkt);
+        try self.queueSend(pkt);
     }
 
     fn handlePubrel(self: *Self, ack: protocol.AckPacket) !void {
@@ -375,7 +497,7 @@ pub const ConnectionHandler = struct {
         }
         var encoder = protocol.Encoder.init(&self.encode_buffer);
         const pkt = try encoder.pubcomp(ack.packet_id);
-        try self.connection.?.sendPacket(pkt);
+        try self.queueSend(pkt);
     }
 
     fn handlePubcomp(self: *Self, ack: protocol.AckPacket) void {
@@ -398,7 +520,7 @@ pub const ConnectionHandler = struct {
             try encoder.subackV5(sub.packet_id, return_codes, null)
         else
             try encoder.suback(sub.packet_id, return_codes);
-        try self.connection.?.sendPacket(pkt);
+        try self.queueSend(pkt);
     }
 
     fn handleUnsubscribe(self: *Self, unsub: protocol.UnsubscribePacket) !void {
@@ -407,12 +529,10 @@ pub const ConnectionHandler = struct {
         const session = self.session.?;
         session.last_activity = std.time.timestamp();
 
-        // For v5.0, we need reason codes for each filter
         var reason_codes: [64]u8 = undefined;
         var i: usize = 0;
         for (unsub.filters) |filter| {
             if (i >= reason_codes.len) break;
-            // 0x00 = Success, 0x11 = No subscription existed
             reason_codes[i] = if (session.removeSubscription(filter)) |sub_id| blk: {
                 _ = self.broker.topic_tree.unsubscribe(filter, sub_id);
                 break :blk 0x00;
@@ -425,7 +545,7 @@ pub const ConnectionHandler = struct {
             try encoder.unsubackV5(unsub.packet_id, reason_codes[0..i], null)
         else
             try encoder.unsuback(unsub.packet_id);
-        try self.connection.?.sendPacket(pkt);
+        try self.queueSend(pkt);
     }
 
     fn handlePingreq(self: *Self) !void {
@@ -434,28 +554,29 @@ pub const ConnectionHandler = struct {
         }
         var encoder = protocol.Encoder.init(&self.encode_buffer);
         const pkt = try encoder.pingresp();
-        try self.connection.?.sendPacket(pkt);
+        try self.queueSend(pkt);
     }
 
     fn handleDisconnect(self: *Self, disc: protocol.DisconnectPacket) void {
         _ = disc;
-        self.clean_disconnect = true; // Mark as clean disconnect
+        self.clean_disconnect = true;
         if (self.session) |session| {
-            session.clearWill(); // Clean disconnect = no will
+            session.clearWill();
         }
         if (self.connection) |*conn| {
-            conn.disconnect(.success); // success = normal_disconnection
+            conn.disconnect(.success);
         }
     }
 
     fn handleAuth(_: *Self, _: protocol.AuthPacket) !void {
-        // AUTH packet handling for v5.0 enhanced authentication
         // TODO: Implement enhanced auth when needed
     }
 };
 
 // Tests
 test "Server init/deinit" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
     const broker = try broker_mod.Broker.init(std.testing.allocator, .{});
     defer broker.deinit();
 

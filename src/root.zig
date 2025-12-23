@@ -11,6 +11,7 @@ pub const broker = @import("broker.zig");
 pub const server = @import("server.zig");
 pub const hook = @import("hook.zig");
 pub const config = @import("config.zig");
+pub const io = @import("io/backend.zig");
 
 // Convenient type aliases
 pub const Protocol = protocol;
@@ -33,4 +34,5 @@ test {
     _ = @import("server.zig");
     _ = @import("hook.zig");
     _ = @import("config.zig");
+    _ = @import("io/backend.zig");
 }
