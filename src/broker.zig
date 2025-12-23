@@ -496,10 +496,17 @@ pub const Connection = struct {
 
         // For QoS 1/2, track the message in pending_outgoing for acknowledgment
         const packet_id: ?u16 = if (qos != .at_most_once) blk: {
+            // Enforce max_inflight per MQTT spec - skip if at limit
+            // (MQTT allows dropping messages when receiver is overwhelmed)
+            const max_inflight = self.broker.config.max_inflight_messages;
+            if (self.session.pending_outgoing.count() >= max_inflight) {
+                return; // Skip this message - subscriber is overwhelmed
+            }
+
             const id = self.session.generatePacketId();
-            // Track for acknowledgment - use empty topic/payload since we don't need to resend
-            // (the message is already being sent, we just need to track the packet_id)
-            self.session.pending_outgoing.put(self.broker.allocator, id, .{
+            // Track for acknowledgment - must succeed for QoS 1/2 flow to work
+            // Use empty topic/payload since we don't need to resend (sent immediately)
+            try self.session.pending_outgoing.put(self.broker.allocator, id, .{
                 .packet_id = id,
                 .topic = "", // Don't dupe - just tracking packet_id for ack
                 .payload = "",
@@ -507,7 +514,7 @@ pub const Connection = struct {
                 .retain = retain,
                 .timestamp = std.time.timestamp(),
                 .state = .sent,
-            }) catch {};
+            });
             break :blk id;
         } else null;
 

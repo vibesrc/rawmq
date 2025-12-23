@@ -22,7 +22,7 @@ pub const Server = struct {
 pub const Limits = struct {
     max_connections: u32 = 100000,
     max_packet_size: u32 = 1048576,
-    max_inflight: u16 = 32,
+    max_inflight: u16 = 65535,
     max_queued_messages: u32 = 1000,
     retry_interval: u32 = 30,
 };

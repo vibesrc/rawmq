@@ -33,7 +33,7 @@ max_connections = 100000
 # Maximum MQTT packet size in bytes (1MB default)
 max_packet_size = 1048576
 # Maximum in-flight messages per client (QoS 1/2)
-max_inflight = 32
+max_inflight = 65535
 # Maximum queued messages for offline clients
 max_queued_messages = 1000
 # Seconds before retrying unacked messages
