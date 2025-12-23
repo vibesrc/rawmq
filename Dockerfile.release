@@ -1,9 +1,14 @@
-# Release Dockerfile - uses pre-built binary
+# Release Dockerfile - uses pre-built binaries
+# Expects bin/rawmq-linux-amd64 and bin/rawmq-linux-arm64
 FROM alpine:3.21
 
+ARG TARGETARCH
+
 WORKDIR /app
-COPY bin/rawmq /app/rawmq
+COPY bin/rawmq-linux-${TARGETARCH} /app/rawmq
 COPY rawmq.toml.example /app/rawmq.toml.example
+
+RUN chmod +x /app/rawmq
 
 EXPOSE 1883
 ENTRYPOINT ["/app/rawmq"]

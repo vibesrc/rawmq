@@ -45,24 +45,26 @@ jobs:
     permissions:
       contents: read
       packages: write
-    strategy:
-      matrix:
-        include:
-          - platform: linux/amd64
-            artifact: rawmq-linux-amd64
-          - platform: linux/arm64
-            artifact: rawmq-linux-arm64
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download binary
+      - name: Download amd64 binary
         uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: rawmq-linux-amd64
           path: bin/
 
-      - name: Set executable
-        run: chmod +x bin/rawmq
+      - name: Rename amd64 binary
+        run: mv bin/rawmq bin/rawmq-linux-amd64
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rawmq-linux-arm64
+          path: bin/
+
+      - name: Rename arm64 binary
+        run: mv bin/rawmq bin/rawmq-linux-arm64
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -82,12 +84,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: |
-            suffix=-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           tags: |
-            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
             type=semver,pattern={{version}}
-            type=sha,prefix=
+            type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -95,36 +96,9 @@ jobs:
           context: .
           file: Dockerfile.release
           push: true
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-  docker-manifest:
-    needs: docker
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    steps:
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Create and push manifest
-        run: |
-          SRC_TAG="${GITHUB_REF_NAME}"
-          MANIFEST_TAG="${GITHUB_REF_NAME}"
-          if [[ "$MANIFEST_TAG" == "main" ]]; then
-            MANIFEST_TAG="latest"
-          fi
-          docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${MANIFEST_TAG} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SRC_TAG}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SRC_TAG}-arm64
 
   release-artifacts:
     if: github.event_name == 'release'
