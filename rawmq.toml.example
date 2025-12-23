@@ -1,0 +1,65 @@
+# rawmq Configuration
+# Copy to rawmq.toml and customize as needed
+#
+# Environment variable substitution:
+#   ${VAR}           - substitute with env var value
+#   ${VAR:-default}  - substitute with env var or default if not set
+#
+# Example: bind = "${RAWMQ_BIND:-0.0.0.0}"
+
+[log]
+# Log level: err, warn, info, debug
+level = "info"
+
+[server]
+# TCP bind address
+bind = "0.0.0.0"
+port = 1883
+# WebSocket (optional)
+# ws_port = 9001
+# ws_path = "/mqtt"
+# Worker threads (0 = auto-detect CPU count)
+workers = 0
+
+[limits]
+# Maximum concurrent connections
+max_connections = 100000
+# Maximum MQTT packet size in bytes (1MB default)
+max_packet_size = 1048576
+# Maximum in-flight messages per client (QoS 1/2)
+max_inflight = 32
+# Maximum queued messages for offline clients
+max_queued_messages = 1000
+# Seconds before retrying unacked messages
+retry_interval = 30
+
+[session]
+# Default keep alive in seconds
+default_keep_alive = 60
+# Maximum keep alive in seconds
+max_keep_alive = 65535
+# Seconds between session expiry checks
+expiry_check_interval = 60
+# Maximum topic aliases (MQTT v5.0)
+max_topic_aliases = 65535
+
+[mqtt]
+# Maximum QoS level (0, 1, or 2)
+max_qos = 2
+# Retained messages available
+retain_available = true
+# Wildcard subscriptions available
+wildcard_subscriptions = true
+# Subscription identifiers available (MQTT v5.0)
+subscription_identifiers = true
+# Shared subscriptions available
+shared_subscriptions = true
+
+[metrics]
+enabled = true
+
+[auth]
+# Enable authentication
+enabled = false
+# Allow anonymous connections when auth is enabled
+allow_anonymous = true

@@ -1,0 +1,9 @@
+# Release Dockerfile - uses pre-built binary
+FROM alpine:3.21
+
+WORKDIR /app
+COPY bin/rawmq /app/rawmq
+COPY rawmq.toml.example /app/rawmq.toml.example
+
+EXPOSE 1883
+ENTRYPOINT ["/app/rawmq"]
