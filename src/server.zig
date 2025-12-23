@@ -523,7 +523,9 @@ pub const ConnectionHandler = struct {
     }
 
     fn handlePubrec(self: *Self, ack: protocol.AckPacket) !void {
-        if (self.session == null) return;
+        const session = self.session orelse return;
+        // Only send PUBREL if we have this packet in pending_outgoing (QoS 2 state machine)
+        if (!session.updateOutgoingQos2State(ack.packet_id)) return;
         var encoder = protocol.Encoder.init(&self.encode_buffer);
         const pkt = try encoder.pubrel(ack.packet_id);
         try self.queueSend(pkt);

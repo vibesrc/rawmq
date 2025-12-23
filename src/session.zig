@@ -94,8 +94,9 @@ pub const Session = struct {
         // Free pending messages
         var pending_it = self.pending_outgoing.iterator();
         while (pending_it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.topic);
-            self.allocator.free(entry.value_ptr.payload);
+            // Only free if we allocated (non-empty means we duped for offline queue)
+            if (entry.value_ptr.topic.len > 0) self.allocator.free(entry.value_ptr.topic);
+            if (entry.value_ptr.payload.len > 0) self.allocator.free(entry.value_ptr.payload);
         }
         self.pending_outgoing.deinit(self.allocator);
         self.pending_incoming_qos2.deinit(self.allocator);
@@ -231,9 +232,21 @@ pub const Session = struct {
 
     pub fn acknowledgeOutgoing(self: *Self, packet_id: u16) bool {
         if (self.pending_outgoing.fetchSwapRemove(packet_id)) |kv| {
-            self.allocator.free(kv.value.topic);
-            self.allocator.free(kv.value.payload);
+            // Only free if we allocated (non-empty means we duped for offline queue)
+            if (kv.value.topic.len > 0) self.allocator.free(kv.value.topic);
+            if (kv.value.payload.len > 0) self.allocator.free(kv.value.payload);
             return true;
+        }
+        return false;
+    }
+
+    /// Update outgoing message state for QoS 2 flow (PUBREC received -> send PUBREL)
+    pub fn updateOutgoingQos2State(self: *Self, packet_id: u16) bool {
+        if (self.pending_outgoing.getPtr(packet_id)) |msg| {
+            if (msg.state == .sent) {
+                msg.state = .pubrel_sent;
+                return true;
+            }
         }
         return false;
     }
@@ -262,8 +275,9 @@ pub const Session = struct {
         // Clear pending messages
         var pending_it = self.pending_outgoing.iterator();
         while (pending_it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.topic);
-            self.allocator.free(entry.value_ptr.payload);
+            // Only free if we allocated (non-empty means we duped for offline queue)
+            if (entry.value_ptr.topic.len > 0) self.allocator.free(entry.value_ptr.topic);
+            if (entry.value_ptr.payload.len > 0) self.allocator.free(entry.value_ptr.payload);
         }
         self.pending_outgoing.clearRetainingCapacity();
         self.pending_incoming_qos2.clearRetainingCapacity();

@@ -494,10 +494,22 @@ pub const Connection = struct {
         var buf: [65536]u8 = undefined;
         var encoder = protocol.Encoder.init(&buf);
 
-        const packet_id: ?u16 = if (qos != .at_most_once)
-            self.session.generatePacketId()
-        else
-            null;
+        // For QoS 1/2, track the message in pending_outgoing for acknowledgment
+        const packet_id: ?u16 = if (qos != .at_most_once) blk: {
+            const id = self.session.generatePacketId();
+            // Track for acknowledgment - use empty topic/payload since we don't need to resend
+            // (the message is already being sent, we just need to track the packet_id)
+            self.session.pending_outgoing.put(self.broker.allocator, id, .{
+                .packet_id = id,
+                .topic = "", // Don't dupe - just tracking packet_id for ack
+                .payload = "",
+                .qos = qos,
+                .retain = retain,
+                .timestamp = std.time.timestamp(),
+                .state = .sent,
+            }) catch {};
+            break :blk id;
+        } else null;
 
         const pkt = if (self.session.protocol_version == .v5_0)
             try encoder.publishV5(pkt_topic, payload, qos, retain, false, packet_id, props)
