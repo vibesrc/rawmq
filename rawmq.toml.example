@@ -20,6 +20,12 @@ port = 1883
 # ws_path = "/mqtt"
 # Worker threads (0 = auto-detect CPU count)
 workers = 0
+# Listen backlog for pending connections (increase for high concurrency)
+backlog = 4096
+# Receive buffer size per connection in bytes
+recv_buffer_size = 65536
+# Max I/O events per poll (io_uring/epoll batch size)
+max_events = 4096
 
 [limits]
 # Maximum concurrent connections

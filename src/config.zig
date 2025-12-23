@@ -13,6 +13,9 @@ pub const Server = struct {
     ws_port: ?u16 = null,
     ws_path: []const u8 = "/mqtt",
     workers: u32 = 0,
+    backlog: u31 = 4096,
+    recv_buffer_size: u32 = 65536,
+    max_events: u32 = 4096,
 };
 
 /// Connection and message limits
@@ -160,6 +163,12 @@ pub const TomlParser = struct {
                 config.server.ws_path = try self.parseString();
             } else if (std.mem.eql(u8, key, "workers")) {
                 config.server.workers = try self.parseInt(u32);
+            } else if (std.mem.eql(u8, key, "backlog")) {
+                config.server.backlog = try self.parseInt(u31);
+            } else if (std.mem.eql(u8, key, "recv_buffer_size")) {
+                config.server.recv_buffer_size = try self.parseInt(u32);
+            } else if (std.mem.eql(u8, key, "max_events")) {
+                config.server.max_events = try self.parseInt(u32);
             }
         } else if (std.mem.eql(u8, section, "limits")) {
             if (std.mem.eql(u8, key, "max_connections")) {

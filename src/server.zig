@@ -11,7 +11,7 @@ const io = @import("io/backend.zig");
 pub const ServerConfig = struct {
     bind_address: []const u8 = "0.0.0.0",
     port: u16 = 1883,
-    backlog: u31 = 128,
+    backlog: u31 = 4096,
     recv_buffer_size: usize = 65536,
     max_events: u32 = 4096,
     workers: u32 = 0, // 0 = auto-detect CPU count
