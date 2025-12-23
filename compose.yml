@@ -1,0 +1,20 @@
+services:
+  rawmq:
+    image: ghcr.io/vibesrc/rawmq:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - 1883:1883
+    security_opt:
+      - no-new-privileges
+      - seccomp=seccomp.json
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1883"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536

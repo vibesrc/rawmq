@@ -173,32 +173,35 @@ fn encodeUserData(socket: Socket, user_data: usize) u64 {
     return @as(u64, @intCast(socket)) | (@as(u64, user_data) << 32);
 }
 
+// Helper to create socket pair
+fn createSocketPair() ![2]i32 {
+    var sockets: [2]i32 = undefined;
+    // SOCK_STREAM = 1, SOCK_CLOEXEC = 0x80000, SOCK_NONBLOCK = 0x800
+    const rc = linux.socketpair(linux.AF.UNIX, 1 | 0x80000 | 0x800, 0, &sockets);
+    if (rc != 0) return error.SocketPairFailed;
+    return sockets;
+}
+
+// Helper to init uring, returns null if not available
+fn initUring(allocator: Allocator) ?*Uring {
+    return Uring.init(allocator, 1024) catch return null;
+}
+
 // Tests
 test "uring init/deinit" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
-    const uring = Uring.init(std.testing.allocator, 1024) catch |err| {
-        // io_uring may not be available on older kernels
-        if (err == error.SystemResources or err == error.PermissionDenied) return error.SkipZigTest;
-        return err;
-    };
+    const uring = initUring(std.testing.allocator) orelse return error.SkipZigTest;
     defer uring.deinit();
 }
 
 test "uring socket lifecycle" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
-    const uring = Uring.init(std.testing.allocator, 1024) catch |err| {
-        if (err == error.SystemResources or err == error.PermissionDenied) return error.SkipZigTest;
-        return err;
-    };
+    const uring = initUring(std.testing.allocator) orelse return error.SkipZigTest;
     defer uring.deinit();
 
-    // Create a socket pair for testing using linux syscall
-    var sockets: [2]i32 = undefined;
-    // SOCK_STREAM = 1, SOCK_CLOEXEC = 0x80000
-    const rc = linux.socketpair(linux.AF.UNIX, 1 | 0x80000, 0, &sockets);
-    if (rc != 0) return error.SocketPairFailed;
+    const sockets = try createSocketPair();
     defer {
         std.posix.close(sockets[0]);
         std.posix.close(sockets[1]);
@@ -207,4 +210,155 @@ test "uring socket lifecycle" {
     try uring.addSocket(sockets[0], 42);
     try uring.submit();
     uring.removeSocket(sockets[0]);
+}
+
+test "uring read event detection" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const uring = initUring(std.testing.allocator) orelse return error.SkipZigTest;
+    defer uring.deinit();
+
+    const sockets = try createSocketPair();
+    defer {
+        std.posix.close(sockets[0]);
+        std.posix.close(sockets[1]);
+    }
+
+    // Watch socket[0] for reads
+    try uring.addSocket(sockets[0], 100);
+
+    // Write to socket[1] - should trigger read on socket[0]
+    const msg = "hello";
+    _ = try std.posix.send(sockets[1], msg, 0);
+
+    // Wait for event
+    var events: [16]Event = undefined;
+    const ready = try uring.wait(&events, 1000);
+
+    try std.testing.expect(ready.len >= 1);
+    try std.testing.expectEqual(@as(i32, sockets[0]), ready[0].socket);
+    try std.testing.expectEqual(EventType.read, ready[0].event_type);
+    try std.testing.expectEqual(@as(usize, 100), ready[0].user_data);
+}
+
+test "uring write event detection" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const uring = initUring(std.testing.allocator) orelse return error.SkipZigTest;
+    defer uring.deinit();
+
+    const sockets = try createSocketPair();
+    defer {
+        std.posix.close(sockets[0]);
+        std.posix.close(sockets[1]);
+    }
+
+    // Watch for write readiness
+    try uring.addSocket(sockets[0], 200);
+    try uring.watchWrite(sockets[0], 200);
+
+    // Socket should be immediately writable
+    var events: [16]Event = undefined;
+    const ready = try uring.wait(&events, 100);
+
+    try std.testing.expect(ready.len >= 1);
+    try std.testing.expectEqual(@as(i32, sockets[0]), ready[0].socket);
+}
+
+test "uring multiple sockets" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const uring = initUring(std.testing.allocator) orelse return error.SkipZigTest;
+    defer uring.deinit();
+
+    // Create 3 socket pairs
+    var pairs: [3][2]i32 = undefined;
+    for (&pairs, 0..) |*pair, i| {
+        pair.* = try createSocketPair();
+        try uring.addSocket(pair[0], i + 1);
+    }
+    defer {
+        for (pairs) |pair| {
+            std.posix.close(pair[0]);
+            std.posix.close(pair[1]);
+        }
+    }
+
+    // Write to all of them
+    for (pairs) |pair| {
+        _ = try std.posix.send(pair[1], "test", 0);
+    }
+
+    // Collect events (may need multiple waits due to io_uring batching)
+    var events: [16]Event = undefined;
+    var total_events: usize = 0;
+    var attempts: usize = 0;
+    while (total_events < 3 and attempts < 5) : (attempts += 1) {
+        const ready = try uring.wait(&events, 100);
+        total_events += ready.len;
+    }
+
+    try std.testing.expect(total_events >= 3);
+}
+
+test "uring close detection" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const uring = initUring(std.testing.allocator) orelse return error.SkipZigTest;
+    defer uring.deinit();
+
+    const sockets = try createSocketPair();
+    defer std.posix.close(sockets[0]);
+
+    // Watch socket[0]
+    try uring.addSocket(sockets[0], 42);
+
+    // Close the other end
+    std.posix.close(sockets[1]);
+
+    // Should get close/hangup event
+    var events: [16]Event = undefined;
+    const ready = try uring.wait(&events, 1000);
+
+    try std.testing.expect(ready.len >= 1);
+    try std.testing.expectEqual(@as(i32, sockets[0]), ready[0].socket);
+    // Should be close or read (read returns 0 on closed connection)
+    try std.testing.expect(ready[0].event_type == .close or ready[0].event_type == .read);
+}
+
+test "uring high connection count" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const uring = Uring.init(std.testing.allocator, 4096) catch return error.SkipZigTest;
+    defer uring.deinit();
+
+    const count = 100;
+    var pairs: [count][2]i32 = undefined;
+    var created: usize = 0;
+
+    // Create many socket pairs
+    for (&pairs, 0..) |*pair, i| {
+        pair.* = createSocketPair() catch break;
+        uring.addSocket(pair[0], i) catch break;
+        created += 1;
+    }
+    defer {
+        for (pairs[0..created]) |pair| {
+            std.posix.close(pair[0]);
+            std.posix.close(pair[1]);
+        }
+    }
+
+    try std.testing.expect(created >= 50); // Should handle at least 50
+
+    // Write to half of them
+    for (pairs[0 .. created / 2]) |pair| {
+        _ = std.posix.send(pair[1], "x", 0) catch {};
+    }
+
+    // Submit and collect events
+    try uring.submit();
+    var events: [128]Event = undefined;
+    const ready = try uring.wait(&events, 100);
+    try std.testing.expect(ready.len > 0);
 }

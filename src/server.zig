@@ -192,6 +192,13 @@ pub const Server = struct {
     fn handleClientEvent(self: *Self, event: io.Event) void {
         const handler = self.connections.get(event.socket) orelse return;
 
+        // Idempotency check - skip if already being closed (io_uring batched events)
+        if (handler.closed) return;
+
+        // Verify conn_id matches - socket descriptors can be reused, so stale events
+        // from old connections may arrive for a new connection on the same fd
+        if (event.user_data != handler.conn_id) return;
+
         switch (event.event_type) {
             .read => {
                 handler.handleRead() catch |err| {
@@ -222,11 +229,17 @@ pub const Server = struct {
     }
 
     fn closeConnection(self: *Self, socket: std.posix.socket_t, handler: *ConnectionHandler) void {
+        // Idempotency - prevent double-close from batched events
+        if (handler.closed) return;
+        handler.closed = true;
+
         self.backend.?.removeSocket(socket);
         _ = self.connections.remove(socket);
         handler.deinit();
         self.allocator.destroy(handler);
-        std.posix.close(socket);
+        // Use raw syscall - std.posix.close panics on BADF which can happen
+        // with io_uring batched events (multiple events for same socket)
+        _ = std.os.linux.close(socket);
     }
 
     /// Run server (blocking)
@@ -252,6 +265,7 @@ pub const ConnectionHandler = struct {
     connection: ?broker_mod.Connection = null,
     connected: bool = false,
     clean_disconnect: bool = false,
+    closed: bool = false, // Idempotency flag for io_uring batched events
     encode_buffer: [65536]u8 = undefined,
     conn_id: usize = 0,
 
@@ -279,10 +293,14 @@ pub const ConnectionHandler = struct {
             self.broker.unregisterConnection(conn);
 
             if (self.session) |session| {
-                if (!self.clean_disconnect and conn.disconnect_reason != .session_taken_over) {
-                    self.broker.publishWill(session);
+                // Don't publish will or remove session during session takeover -
+                // the new connection is using this session
+                if (conn.disconnect_reason != .session_taken_over) {
+                    if (!self.clean_disconnect) {
+                        self.broker.publishWill(session);
+                    }
+                    self.broker.sessions.maybeRemove(session);
                 }
-                self.broker.sessions.maybeRemove(session);
             }
         } else if (self.session) |session| {
             self.broker.sessions.maybeRemove(session);
@@ -300,13 +318,23 @@ pub const ConnectionHandler = struct {
                 return error.BufferFull;
             }
 
-            const n = std.posix.recv(self.socket, self.recv_buffer[self.recv_pos..], 0) catch |err| {
-                if (err == error.WouldBlock) return;
-                return err;
-            };
+            // Use raw syscall to handle EBADF gracefully (can happen with io_uring batched events)
+            const buf = self.recv_buffer[self.recv_pos..];
+            const rc = std.os.linux.recvfrom(self.socket, buf.ptr, buf.len, 0, null, null);
+            if (rc == 0) return error.ConnectionClosed;
 
-            if (n == 0) return error.ConnectionClosed;
+            if (@as(isize, @bitCast(rc)) < 0) {
+                const err: std.posix.E = @enumFromInt(@as(u16, @truncate(@as(usize, @bitCast(-@as(isize, @bitCast(rc)))))));
+                return switch (err) {
+                    .AGAIN => return, // WouldBlock
+                    .BADF, .NOTCONN, .NOTSOCK => error.ConnectionClosed, // Socket already closed
+                    .CONNRESET, .CONNREFUSED => error.ConnectionReset,
+                    .INTR => continue,
+                    else => error.RecvError,
+                };
+            }
 
+            const n: usize = rc;
             self.recv_pos += n;
             _ = self.broker.stats.bytes_received.fetchAdd(n, .monotonic);
 
@@ -318,11 +346,21 @@ pub const ConnectionHandler = struct {
     /// Handle write-ready event
     pub fn handleWrite(self: *Self) !void {
         while (self.send_pos < self.send_buffer.items.len) {
-            const n = std.posix.send(self.socket, self.send_buffer.items[self.send_pos..], 0) catch |err| {
-                if (err == error.WouldBlock) return;
-                return err;
-            };
-            self.send_pos += n;
+            const buf = self.send_buffer.items[self.send_pos..];
+            const rc = std.os.linux.sendto(self.socket, buf.ptr, buf.len, 0, null, 0);
+
+            if (@as(isize, @bitCast(rc)) < 0) {
+                const err: std.posix.E = @enumFromInt(@as(u16, @truncate(@as(usize, @bitCast(-@as(isize, @bitCast(rc)))))));
+                return switch (err) {
+                    .AGAIN => return, // WouldBlock
+                    .BADF, .NOTCONN, .NOTSOCK, .PIPE => error.ConnectionClosed,
+                    .CONNRESET, .CONNREFUSED => error.ConnectionReset,
+                    .INTR => continue,
+                    else => error.SendError,
+                };
+            }
+
+            self.send_pos += rc;
         }
 
         // All data sent, clear buffer

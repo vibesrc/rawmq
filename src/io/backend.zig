@@ -146,13 +146,169 @@ pub fn forceBackend(allocator: Allocator, backend_type: enum { io_uring, epoll }
     }
 }
 
+// Helper to create socket pair for tests
+fn createSocketPair() ![2]std.posix.socket_t {
+    const linux = std.os.linux;
+    var sockets: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, 1 | 0x80000 | 0x800, 0, &sockets);
+    if (rc != 0) return error.SocketPairFailed;
+    return sockets;
+}
+
 // Tests
 test "backend detection" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
-    const backend = try detectBest(std.testing.allocator, 1024);
-    defer backend.deinit();
+    const b = try detectBest(std.testing.allocator, 1024);
+    defer b.deinit();
 
     // Should get some backend
-    _ = backend.name();
+    const backend_name = b.name();
+    try std.testing.expect(std.mem.eql(u8, backend_name, "io_uring") or std.mem.eql(u8, backend_name, "epoll"));
+}
+
+test "backend force epoll" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const b = try forceBackend(std.testing.allocator, .epoll, 1024);
+    defer b.deinit();
+
+    try std.testing.expectEqualStrings("epoll", b.name());
+}
+
+test "backend force io_uring" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const b = forceBackend(std.testing.allocator, .io_uring, 1024) catch return error.SkipZigTest;
+    defer b.deinit();
+
+    try std.testing.expectEqualStrings("io_uring", b.name());
+}
+
+test "backend unified socket operations" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const b = try detectBest(std.testing.allocator, 1024);
+    defer b.deinit();
+
+    const sockets = try createSocketPair();
+    defer {
+        std.posix.close(sockets[0]);
+        std.posix.close(sockets[1]);
+    }
+
+    // Test add/remove/watch operations through unified interface
+    try b.addSocket(sockets[0], 42);
+    try b.watchWrite(sockets[0], 42);
+    try b.watchRead(sockets[0], 42);
+    b.removeSocket(sockets[0]);
+}
+
+test "backend unified event detection" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const b = try detectBest(std.testing.allocator, 1024);
+    defer b.deinit();
+
+    const sockets = try createSocketPair();
+    defer {
+        std.posix.close(sockets[0]);
+        std.posix.close(sockets[1]);
+    }
+
+    // Watch socket[0] for reads
+    try b.addSocket(sockets[0], 100);
+    try b.submit();
+
+    // Write to socket[1] - should trigger read on socket[0]
+    _ = try std.posix.send(sockets[1], "hello", 0);
+
+    // Wait for event
+    var events: [16]Event = undefined;
+    const ready = try b.wait(&events, 1000);
+
+    try std.testing.expect(ready.len >= 1);
+    try std.testing.expectEqual(@as(std.posix.socket_t, sockets[0]), ready[0].socket);
+    try std.testing.expectEqual(EventType.read, ready[0].event_type);
+    try std.testing.expectEqual(@as(usize, 100), ready[0].user_data);
+}
+
+test "backend both implementations produce same events" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // Test epoll
+    const epoll_backend = try forceBackend(std.testing.allocator, .epoll, 1024);
+    defer epoll_backend.deinit();
+
+    const sockets1 = try createSocketPair();
+    defer {
+        std.posix.close(sockets1[0]);
+        std.posix.close(sockets1[1]);
+    }
+
+    try epoll_backend.addSocket(sockets1[0], 1);
+    _ = try std.posix.send(sockets1[1], "test", 0);
+
+    var events1: [16]Event = undefined;
+    const ready1 = try epoll_backend.wait(&events1, 100);
+
+    // Test io_uring if available
+    const uring_backend = forceBackend(std.testing.allocator, .io_uring, 1024) catch return;
+    defer uring_backend.deinit();
+
+    const sockets2 = try createSocketPair();
+    defer {
+        std.posix.close(sockets2[0]);
+        std.posix.close(sockets2[1]);
+    }
+
+    try uring_backend.addSocket(sockets2[0], 1);
+    try uring_backend.submit();
+    _ = try std.posix.send(sockets2[1], "test", 0);
+
+    var events2: [16]Event = undefined;
+    const ready2 = try uring_backend.wait(&events2, 100);
+
+    // Both should detect read events
+    try std.testing.expect(ready1.len >= 1);
+    try std.testing.expect(ready2.len >= 1);
+    try std.testing.expectEqual(ready1[0].event_type, ready2[0].event_type);
+}
+
+test "backend multiple sockets unified" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const b = try detectBest(std.testing.allocator, 1024);
+    defer b.deinit();
+
+    // Create 5 socket pairs
+    var pairs: [5][2]std.posix.socket_t = undefined;
+    for (&pairs, 0..) |*pair, i| {
+        pair.* = try createSocketPair();
+        try b.addSocket(pair[0], i + 1);
+    }
+    defer {
+        for (pairs) |pair| {
+            std.posix.close(pair[0]);
+            std.posix.close(pair[1]);
+        }
+    }
+
+    try b.submit();
+
+    // Write to all of them
+    for (pairs) |pair| {
+        _ = try std.posix.send(pair[1], "data", 0);
+    }
+
+    // Collect events
+    var events: [32]Event = undefined;
+    var total: usize = 0;
+    var attempts: usize = 0;
+    while (total < 5 and attempts < 10) : (attempts += 1) {
+        const ready = try b.wait(&events, 100);
+        total += ready.len;
+    }
+
+    try std.testing.expect(total >= 5);
 }

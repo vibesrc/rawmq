@@ -108,13 +108,19 @@ pub const Broker = struct {
         self.connections_lock.lock();
         defer self.connections_lock.unlock();
 
+        // Use stored client_id copy to avoid dangling session pointer issues
+        const client_id = conn.clientId();
+
         // Check if client already connected
-        if (self.connections.get(conn.session.client_id)) |existing| {
+        if (self.connections.get(client_id)) |existing| {
             // Disconnect existing connection (session takeover)
             existing.disconnect(.session_taken_over);
+            // IMPORTANT: Remove old entry first! HashMap.put keeps the OLD key pointer,
+            // which would become dangling when the old connection is freed.
+            _ = self.connections.remove(client_id);
         }
 
-        try self.connections.put(self.allocator, conn.session.client_id, conn);
+        try self.connections.put(self.allocator, client_id, conn);
         _ = self.stats.active_connections.fetchAdd(1, .monotonic);
         _ = self.stats.total_connections.fetchAdd(1, .monotonic);
     }
@@ -124,11 +130,14 @@ pub const Broker = struct {
         self.connections_lock.lock();
         defer self.connections_lock.unlock();
 
+        // Use stored client_id (not session pointer) to avoid dangling pointer issues
+        const client_id = conn.clientId();
+
         // Only remove if this connection is still the registered one
         // (avoids removing a new connection after session takeover)
-        if (self.connections.get(conn.session.client_id)) |registered| {
+        if (self.connections.get(client_id)) |registered| {
             if (registered == conn) {
-                _ = self.connections.remove(conn.session.client_id);
+                _ = self.connections.remove(client_id);
                 _ = self.stats.active_connections.fetchSub(1, .monotonic);
             }
         }
@@ -423,24 +432,37 @@ pub const Connection = struct {
     broker: *Broker,
     session: *session_mod.Session,
     socket: std.posix.socket_t,
+    // Store client_id directly to avoid dangling session pointer during unregister
+    client_id_buf: [256]u8 = undefined,
+    client_id_len: u8 = 0,
     send_lock: std.Thread.Mutex = .{},
     disconnected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     disconnect_reason: protocol.ReasonCode = .success, // success = normal_disconnection = 0x00
 
     pub fn init(broker: *Broker, session: *session_mod.Session, socket: std.posix.socket_t) Self {
-        return .{
+        var conn = Self{
             .broker = broker,
             .session = session,
             .socket = socket,
         };
+        // Copy client_id to avoid dangling pointer issues
+        const len: u8 = @intCast(@min(session.client_id.len, 256));
+        @memcpy(conn.client_id_buf[0..len], session.client_id[0..len]);
+        conn.client_id_len = len;
+        return conn;
+    }
+
+    pub fn clientId(self: *const Self) []const u8 {
+        return self.client_id_buf[0..self.client_id_len];
     }
 
     pub fn disconnect(self: *Self, reason: protocol.ReasonCode) void {
         if (self.disconnected.swap(true, .seq_cst)) return; // Already disconnected
         self.disconnect_reason = reason;
-        // Shutdown then close socket to properly signal the disconnect to the client
-        _ = std.posix.shutdown(self.socket, .both) catch {};
-        std.posix.close(self.socket);
+        // Shutdown socket to signal disconnect - use raw syscalls as these may race
+        // with the event loop's close (io_uring batched events)
+        _ = std.os.linux.shutdown(self.socket, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(self.socket);
     }
 
     pub fn isDisconnected(self: *Self) bool {

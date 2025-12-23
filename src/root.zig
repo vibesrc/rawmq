@@ -21,7 +21,7 @@ pub const Session = session.Session;
 pub const TopicTree = topic.TopicTree;
 
 // Version info
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 pub const mqtt_versions = [_][]const u8{ "3.1.1", "5.0" };
 
 test {
