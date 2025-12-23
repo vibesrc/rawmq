@@ -112,6 +112,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Create and push manifest
         run: |
           SRC_TAG="${GITHUB_REF_NAME}"
@@ -119,10 +122,9 @@ jobs:
           if [[ "$MANIFEST_TAG" == "main" ]]; then
             MANIFEST_TAG="latest"
           fi
-          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${MANIFEST_TAG} \
+          docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${MANIFEST_TAG} \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SRC_TAG}-amd64 \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SRC_TAG}-arm64
-          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${MANIFEST_TAG}
 
   release-artifacts:
     if: github.event_name == 'release'
